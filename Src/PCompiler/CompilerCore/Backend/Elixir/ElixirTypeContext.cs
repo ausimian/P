@@ -184,7 +184,10 @@ namespace Plang.Compiler.Backend.Elixir
                     return "\"\"";
 
                 default:
-                    // machine, event, any, null, data, foreign — no zero value on the BEAM.
+                    // machine, event, any, null, data, foreign — no zero value on the BEAM, so nil.
+                    // For `any` (M7) this is the whole story: an `any` value is an opaque BEAM term,
+                    // so it needs no per-type mapping — it is constructed, compared, passed and cast
+                    // through the same emitter paths as its concrete underlying value.
                     return "nil";
             }
         }

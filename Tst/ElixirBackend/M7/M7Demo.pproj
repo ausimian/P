@@ -1,0 +1,8 @@
+<!-- P project for the Elixir backend M7 fixture (the `any` type and failure surfacing). -->
+<Project>
+<ProjectName>M7Demo</ProjectName>
+<InputFiles>
+	<PFile>./Polish.p</PFile>
+</InputFiles>
+<OutputDir>./PGenerated/</OutputDir>
+</Project>

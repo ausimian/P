@@ -38,6 +38,12 @@ namespace Plang.Compiler.Backend.Elixir
     /// opaque Elixir terms the generated code never inspects. A <c>FOREIGN.md</c> binding guide with a
     /// ready-to-copy <c>PForeign</c> stub is emitted alongside the project.
     ///
+    /// M7 (polish): the <c>any</c> type rides the existing cast/default pass-through (an <c>any</c>
+    /// value is just a BEAM term). Failures are surfaced faithfully — an event a state cannot handle
+    /// is routed to <c>PRuntime.unhandled_event/3</c> (which raises, mirroring P's abort) instead of
+    /// being silently dropped, and a generated <c>terminate/3</c> reports an abnormal crash to the
+    /// trace/log. The <c>Tst/ElixirBackend</c> harness suite is the cross-milestone conformance suite.
+    ///
     /// Like PObserve, this backend has no compilation stage: the generated mix project is meant
     /// to be consumed as a dependency by a host application, which builds it with the standard
     /// Elixir toolchain (<c>mix</c>). <see cref="ICodeGenerator.HasCompilationStage"/> stays false.
@@ -176,7 +182,7 @@ $@"defmodule {modulePrefix}.MixProject do
 
   defp deps do
     [
-      {{:p_runtime, github: ""ausimian/p_runtime"", ref: ""481515a7d16191cef70956db97dd8a58a7474ab9""}}
+      {{:p_runtime, github: ""ausimian/p_runtime"", ref: ""07620ad5c243515603fbc7c6cdb705ae71e71b04""}}
     ]
   end
 end
@@ -318,9 +324,23 @@ $@"defmodule {modulePrefix}.{machine.Name} do
             }
 
             sb.Append(
-@"  # Catch-all: an event the current state neither handles, defers nor ignores is dropped.
-  # (P would raise an unhandled-event error; matching that is out of scope for now.)
+@"  # A P event the current state neither handles, defers nor ignores is an error in P (the machine
+  # aborts). Route it through the runtime, which records it, logs it, and raises
+  # PRuntime.UnhandledEvent — rather than silently dropping it and masking the divergence (M7).
+  def handle_event(_type, {:p_event, event, _payload}, state, data) do
+    PRuntime.unhandled_event(data.__id__, state, event)
+  end
+
+  # Catch-all for non-P messages (`:info` and the like): ignore them, so a machine is not brittle to
+  # stray messages. Only genuine P events reach the unhandled-event clause above.
   def handle_event(_type, _content, _state, _data), do: :keep_state_and_data
+
+  # Surface an abnormal exit to the trace/log with machine + state context (DESIGN.md Open
+  # Question 3). A clean stop (:normal halt, :shutdown) and an already-reported violation are silent.
+  @impl true
+  def terminate(reason, state, data) do
+    PRuntime.terminated(data.__id__, state, reason)
+  end
 end
 ");
 

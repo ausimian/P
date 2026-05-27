@@ -1,0 +1,48 @@
+name: Elixir Backend Conformance
+
+# Runs the P -> Elixir backend conformance suite: each Tst/ElixirBackend/M* fixture is compiled
+# with `p compile --mode elixir` and its ExUnit harness is run. The harnesses encode hand-verified
+# expected observable traces, so a green run is the conformance assertion that generated programs
+# behave as the P semantics require (DESIGN.md M7).
+#
+# The harnesses depend on the p_runtime runtime library via a `path:` override pointing at
+# ~/Code/p_runtime, so this workflow clones it there. p_runtime's main branch must carry the
+# commit the generated mix.exs references (the Elixir backend bumps that ref per milestone).
+
+on:
+  push:
+    paths:
+      - 'Src/PCompiler/CompilerCore/Backend/Elixir/**'
+      - 'Tst/ElixirBackend/**'
+      - '.github/workflows/elixir-backend.yml'
+  pull_request:
+    paths:
+      - 'Src/PCompiler/CompilerCore/Backend/Elixir/**'
+      - 'Tst/ElixirBackend/**'
+      - '.github/workflows/elixir-backend.yml'
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Set up Elixir/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          elixir-version: '1.18'
+
+      - name: Build the P compiler
+        run: ./Bld/build.sh --config Release
+
+      - name: Fetch p_runtime
+        run: git clone --depth 1 https://github.com/ausimian/p_runtime.git "$HOME/Code/p_runtime"
+
+      - name: Run conformance suite
+        run: Tst/ElixirBackend/run_conformance.sh
