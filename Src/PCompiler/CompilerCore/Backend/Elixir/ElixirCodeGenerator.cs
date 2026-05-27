@@ -19,8 +19,14 @@ namespace Plang.Compiler.Backend.Elixir
     /// M2 (payloads and the type system): event/entry payloads are bound and threaded; machine
     /// fields and locals are supported; all primitive types, tuples, named tuples (each distinct
     /// shape becomes a generated <c>defstruct</c> module under <c>&lt;Prefix&gt;.Types</c>) and
-    /// seq/set/map map onto built-in Elixir terms. Cross-machine sends, defer/ignore, specs and
-    /// foreign code arrive in later milestones.
+    /// seq/set/map map onto built-in Elixir terms.
+    ///
+    /// M3 (multiple machines and sends): <c>new</c> spawns machines under the DynamicSupervisor;
+    /// cross-machine sends resolve targets by opaque id through the registry.
+    ///
+    /// M4 (defer, raise, ignore): <c>defer E</c> postpones the event, <c>ignore E</c> drops it, and a
+    /// non-halt <c>raise E</c> re-delivers <c>E</c> front-of-queue. Specs and foreign code arrive in
+    /// later milestones.
     ///
     /// Like PObserve, this backend has no compilation stage: the generated mix project is meant
     /// to be consumed as a dependency by a host application, which builds it with the standard
@@ -114,7 +120,7 @@ $@"defmodule {modulePrefix}.MixProject do
 
   defp deps do
     [
-      {{:p_runtime, github: ""ausimian/p_runtime"", ref: ""746a2155965f82764652a6d8023d609b011043d3""}}
+      {{:p_runtime, github: ""ausimian/p_runtime"", ref: ""77299ced23616394b5461fd7d6e2bcb4815a4758""}}
     ]
   end
 end
@@ -236,8 +242,8 @@ $@"defmodule {modulePrefix}.{machine.Name} do
             }
 
             sb.Append(
-@"  # Catch-all: an event with no handler in the current state is dropped. Proper defer/ignore
-  # handling arrives in M4.
+@"  # Catch-all: an event the current state neither handles, defers nor ignores is dropped.
+  # (P would raise an unhandled-event error; matching that is out of scope for now.)
   def handle_event(_type, _content, _state, _data), do: :keep_state_and_data
 end
 ");
@@ -289,7 +295,7 @@ end
                     {
                         var emitter = NewEmitter(doAction.Target);
                         var body = emitter.Render(indent, tail: true, state.Name);
-                        sb.Append($"  def handle_event(:cast, {{:p_event, {evAtom}, {Pattern(emitter)}}}, {atom}, data) do\n");
+                        sb.Append($"  def handle_event(_type, {{:p_event, {evAtom}, {Pattern(emitter)}}}, {atom}, data) do\n");
                         sb.Append($"    PRuntime.dequeued(data.__id__, {atom}, {evAtom})\n");
                         sb.Append(body);
                         sb.Append("  end\n\n");
@@ -301,7 +307,7 @@ end
                         var fn = gotoState.TransitionFunction;
                         var emitter = fn != null ? NewEmitter(fn) : null;
                         var body = emitter?.Render(indent, tail: false, state.Name) ?? "";
-                        sb.Append($"  def handle_event(:cast, {{:p_event, {evAtom}, {Pattern(emitter)}}}, {atom}, data) do\n");
+                        sb.Append($"  def handle_event(_type, {{:p_event, {evAtom}, {Pattern(emitter)}}}, {atom}, data) do\n");
                         sb.Append($"    PRuntime.dequeued(data.__id__, {atom}, {evAtom})\n");
                         sb.Append(body);
                         sb.Append($"    PRuntime.goto(data.__id__, {atom}, {ElixirNames.Atom(gotoState.Target.Name)}, data, nil)\n");
@@ -309,10 +315,19 @@ end
                         break;
                     }
 
+                    // `defer E` → :postpone the event so :gen_statem re-delivers it after the next
+                    // state change; `ignore E` → dequeue and discard. The runtime helpers build the
+                    // return and record the trace, so generated code stays logging-free.
                     case EventDefer _:
+                        sb.Append($"  def handle_event(_type, {{:p_event, {evAtom}, _payload}}, {atom}, data) do\n");
+                        sb.Append($"    PRuntime.defer(data.__id__, {atom}, {evAtom})\n");
+                        sb.Append("  end\n\n");
+                        break;
+
                     case EventIgnore _:
-                        sb.Append($"  # TODO(M4): {handler.Value.GetType().Name} for {ev.Name}\n");
-                        sb.Append($"  def handle_event(:cast, {{:p_event, {evAtom}, _payload}}, {atom}, _data), do: :keep_state_and_data\n\n");
+                        sb.Append($"  def handle_event(_type, {{:p_event, {evAtom}, _payload}}, {atom}, data) do\n");
+                        sb.Append($"    PRuntime.ignore(data.__id__, {atom}, {evAtom})\n");
+                        sb.Append("  end\n\n");
                         break;
                 }
             }

@@ -25,9 +25,11 @@ namespace Plang.Compiler.Backend.Elixir
     /// <para><b>Effect vs tail mode.</b> A handler must ultimately yield one <c>:gen_statem</c> return.
     /// Statements not in tail position run in <em>effect</em> mode (rebind the accumulators, produce no
     /// return); the last statement of the body runs in <em>tail</em> mode and produces the return —
-    /// a <c>goto</c>/<c>halt</c>, a tail <c>if</c> whose branches each return, or a fall-through
-    /// <c>{:keep_state, data}</c>. Constructs from later milestones (send, announce, new, loops,
-    /// non-halt raise, function calls) emit a TODO marker and fall through.</para>
+    /// a <c>goto</c>/<c>halt</c>/<c>raise</c>, a tail <c>if</c> whose branches each return, or a
+    /// fall-through <c>{:keep_state, data}</c>. A non-halt <c>raise E</c> is terminal too: it
+    /// produces a <c>{:keep_state, …, [{:next_event, :internal, …}]}</c> return that queues
+    /// <c>E</c> front-of-queue. Constructs from later milestones (announce, loops, function calls)
+    /// emit a TODO marker and fall through.</para>
     /// </summary>
     internal sealed class ElixirFunctionEmitter
     {
@@ -247,11 +249,15 @@ namespace Plang.Compiler.Backend.Elixir
                     Line(sb, indent, EmitCtor(ctor.Interface, ctor.Arguments));
                     break;
 
-                // ---- deferred to later milestones: emit a marker and fall through ----------
                 case RaiseStmt raiseStmt:
-                    Todo(sb, indent, "M4", $"raise {EventName(raiseStmt.Event)} (non-halt)");
-                    break;
+                    // Non-halt raise: terminal, like halt and goto. Queues the event front-of-queue
+                    // (via the runtime) and produces the :gen_statem return; statements after a raise
+                    // are unreachable in P, so we never fall through to append a keep return.
+                    Line(sb, indent,
+                        $"PRuntime.raise_event(data.__id__, {ElixirNames.Atom(currentState)}, {EmitEventExpr(raiseStmt.Event)}, {PackArgs(raiseStmt.Payload)}, data)");
+                    return;
 
+                // ---- deferred to later milestones: emit a marker and fall through ----------
                 case AnnounceStmt announce:
                     Todo(sb, indent, "M5", $"announce {EventName(announce.Event)}");
                     break;

@@ -1,0 +1,8 @@
+<!-- P project for the Elixir backend M4 fixture (defer, ignore, and non-halt raise). -->
+<Project>
+<ProjectName>M4Demo</ProjectName>
+<InputFiles>
+	<PFile>./Defer.p</PFile>
+</InputFiles>
+<OutputDir>./PGenerated/</OutputDir>
+</Project>
