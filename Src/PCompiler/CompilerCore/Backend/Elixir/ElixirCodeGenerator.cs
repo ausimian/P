@@ -156,7 +156,7 @@ $@"defmodule {modulePrefix}.MixProject do
 
   defp deps do
     [
-      {{:p_runtime, github: ""ausimian/p_runtime"", ref: ""77299ced23616394b5461fd7d6e2bcb4815a4758""}}
+      {{:p_runtime, github: ""ausimian/p_runtime"", ref: ""481515a7d16191cef70956db97dd8a58a7474ab9""}}
     ]
   end
 end
