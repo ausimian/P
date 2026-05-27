@@ -1,0 +1,8 @@
+<!-- P project for the Elixir backend M1 walking-skeleton fixture. -->
+<Project>
+<ProjectName>M1Demo</ProjectName>
+<InputFiles>
+	<PFile>./Walker.p</PFile>
+</InputFiles>
+<OutputDir>./PGenerated/</OutputDir>
+</Project>

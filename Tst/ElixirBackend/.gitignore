@@ -1,0 +1,7 @@
+# Generated mix project (produced by `p compile --mode elixir`)
+M1/PGenerated/
+
+# Elixir build artifacts for the test harness
+M1/harness/_build/
+M1/harness/deps/
+M1/harness/mix.lock

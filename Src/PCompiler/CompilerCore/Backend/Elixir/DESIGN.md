@@ -192,9 +192,11 @@ end
 
 Notes on the shape:
 
+- **`handle_event_function` mode, not `state_functions`.** The sketch above (`def Init`, `def Waiting`) is illustrative but not valid Elixir: P state names are PascalCase, and you cannot `def` an uppercase-named function. The implementation therefore uses `[:handle_event_function, :state_enter]` — a single `handle_event/4` with clauses matching on the state atom (`:"Init"`, `:"Waiting"`). This handles arbitrary P state names without identifier gymnastics and is simpler to generate.
 - `:state_enter` mode is enabled even when entry handlers are empty, so the codegen stays uniform.
 - P's `entry` is encoded as a synthetic `:__entry__` internal event raised from `init`, rather than running in `init` itself. This keeps the "entry runs in the new state" invariant clean across all transitions.
-- `raise halt` is just `{:stop, :normal, _}`.
+- `raise halt` is just `{:stop, :normal, _}`. P lowers `raise halt` to `tmp = halt; raise tmp`, so the codegen resolves the raised temporary back to its event to recognise halt.
+- Machines run `:transient` under the `DynamicSupervisor`/`Supervisor`, so a normal halt is not restarted (Open Question 3).
 - Postpone clauses are generated *above* the catch-all so they take precedence.
 
 ## The `p_runtime` library
@@ -216,7 +218,9 @@ The split between generated code and `p_runtime` follows the same principle as t
 
 Phased so each milestone runs end-to-end.
 
-**M1 — Walking skeleton.** One machine, two states, one event with no payload, halt. No specs, no foreign code, no types beyond `int`. Goal: prove the codegen plumbing on the .NET side and the `:gen_statem` shape on the Elixir side. The harness is a hand-written host mix project that takes the generated lib as a `path:` dep, starts `<Prefix>.Supervisor` in its `test_helper.exs`, drives a machine from an ExUnit test, and asserts the expected transition trace.
+**M1 — Walking skeleton. ✅ Done.** One machine, two states, one event with no payload, halt. No specs, no foreign code, no types beyond `int`. Goal: prove the codegen plumbing on the .NET side and the `:gen_statem` shape on the Elixir side. The harness is a hand-written host mix project that takes the generated lib as a `path:` dep, starts `<Prefix>.Supervisor`, drives a machine from an ExUnit test, and asserts the expected transition trace.
+
+Delivered: `ElixirCodeGenerator` emits one `:gen_statem` per machine and wires the start machines into the supervisor; the `p_runtime` library (vendored at `~/Code/p_runtime`) provides the registry, trace recorder, and `goto`/`halt`/`send`/logging helpers; the fixture and harness live under `Tst/ElixirBackend/M1/` (`Walker.p`, `M1Demo.pproj`, `harness/`). Run: `p compile --mode elixir` in `Tst/ElixirBackend/M1/`, then `mix test` in `harness/`.
 
 **M2 — Payloads and the type system.** All primitive types, tuples, named tuples, seq/set/map. Generate the struct modules for named tuples. Add `MapSet` and `Map` conversions. No `any` yet.
 
