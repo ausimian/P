@@ -81,7 +81,7 @@ $@"defmodule {modulePrefix}.MixProject do
 
   defp deps do
     [
-      {{:p_runtime, ""~> 0.1""}}
+      {{:p_runtime, github: ""ausimian/p_runtime""}}
     ]
   end
 end

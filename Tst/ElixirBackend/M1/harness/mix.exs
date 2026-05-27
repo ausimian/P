@@ -1,11 +1,12 @@
 defmodule M1Harness.MixProject do
   use Mix.Project
 
-  # Host project that drives the generated M1 program from ExUnit. It takes the generated
-  # mix lib (under ../PGenerated/Elixir) and the vendored p_runtime as path deps, exactly as
-  # a real consumer would — except the deps are local paths rather than Hex packages.
+  # Host project that drives the generated M1 program from ExUnit. It depends on the generated
+  # mix lib (path, under ../PGenerated/Elixir) and on p_runtime from GitHub — the same source the
+  # generated lib declares.
   #
-  # Run `p compile --mode elixir` in the parent directory first, then `mix test` here.
+  # Run `p compile --mode elixir` in the parent directory first, then `mix test` here
+  # (the first run fetches p_runtime from GitHub).
   def project do
     [
       app: :m1_harness,
@@ -21,8 +22,8 @@ defmodule M1Harness.MixProject do
 
   defp deps do
     [
-      # `override: true` makes this path dep win over the generated lib's `{:p_runtime, "~> 0.1"}`.
-      {:p_runtime, path: Path.join(System.user_home!(), "Code/p_runtime"), override: true},
+      # Same GitHub source the generated lib declares, so the two converge.
+      {:p_runtime, github: "ausimian/p_runtime"},
       {:m1_demo, path: "../PGenerated/Elixir"}
     ]
   end
