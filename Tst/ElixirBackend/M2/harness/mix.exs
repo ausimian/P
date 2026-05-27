@@ -2,11 +2,10 @@ defmodule M2Harness.MixProject do
   use Mix.Project
 
   # Host project that drives the generated M2 program from ExUnit. It depends on the generated
-  # mix lib (path, under ../PGenerated/Elixir) and on p_runtime.
+  # mix lib (path, under ../PGenerated/Elixir) and on the vendored p_runtime via a `path` override
+  # (overriding the generated lib's github declaration), so the harness tracks local runtime work.
   #
-  # p_runtime is pinned to the exact commit the generated lib declares, overriding the generated
-  # lib's own (identical) declaration. Run `p compile --mode elixir` in the parent directory first,
-  # then `mix test` here (the first run fetches p_runtime from GitHub).
+  # Run `p compile --mode elixir` in the parent directory first, then `mix test` here.
   def project do
     [
       app: :m2_harness,
@@ -22,7 +21,7 @@ defmodule M2Harness.MixProject do
 
   defp deps do
     [
-      {:p_runtime, github: "ausimian/p_runtime", ref: "85d4291f00612a52beada10aef9a99f45363fa60", override: true},
+      {:p_runtime, path: "~/Code/p_runtime" |> Path.expand(), override: true},
       {:m2_demo, path: "../PGenerated/Elixir"}
     ]
   end

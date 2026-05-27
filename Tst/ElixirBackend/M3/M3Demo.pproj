@@ -1,0 +1,8 @@
+<!-- P project for the Elixir backend M3 fixture (multiple machines and sends). -->
+<Project>
+<ProjectName>M3Demo</ProjectName>
+<InputFiles>
+	<PFile>./PingPong.p</PFile>
+</InputFiles>
+<OutputDir>./PGenerated/</OutputDir>
+</Project>

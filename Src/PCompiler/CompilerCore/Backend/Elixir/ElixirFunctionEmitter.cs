@@ -35,6 +35,8 @@ namespace Plang.Compiler.Backend.Elixir
         private readonly Function fn;
         private readonly ElixirTypeContext types;
         private readonly NameAllocator fields;
+        private readonly string modulePrefix;
+        private readonly System.Func<Interface, string> resolveMachineName;
         private readonly NameAllocator locals = new NameAllocator();
         private readonly Variable paramVar;
         private readonly bool hasLocals;
@@ -51,12 +53,15 @@ namespace Plang.Compiler.Backend.Elixir
         // Elixir variable the event/entry payload is bound to in the clause head.
         private const string PayloadVar = "payload";
 
-        public ElixirFunctionEmitter(Machine machine, NameAllocator fields, Function fn, ElixirTypeContext types)
+        public ElixirFunctionEmitter(Machine machine, NameAllocator fields, Function fn, ElixirTypeContext types,
+            string modulePrefix, System.Func<Interface, string> resolveMachineName)
         {
             this.machine = machine;
             this.fields = fields;
             this.fn = fn;
             this.types = types;
+            this.modulePrefix = modulePrefix;
+            this.resolveMachineName = resolveMachineName;
 
             paramVar = fn.Signature.Parameters.FirstOrDefault();
             foreach (var p in fn.Signature.Parameters)
@@ -182,7 +187,7 @@ namespace Plang.Compiler.Backend.Elixir
                     return;
 
                 case RaiseStmt raiseStmt when ResolveEvent(raiseStmt.Event) is { IsHaltEvent: true }:
-                    Line(sb, indent, $"PRuntime.halt(@p_machine, {ElixirNames.Atom(currentState)}, data)");
+                    Line(sb, indent, $"PRuntime.halt(data.__id__, {ElixirNames.Atom(currentState)}, data)");
                     return;
 
                 case IfStmt ifStmt:
@@ -230,15 +235,19 @@ namespace Plang.Compiler.Backend.Elixir
                     Line(sb, indent, $"if !({EmitExpr(assert.Assertion)}), do: raise({EmitExpr(assert.Message)})");
                     break;
 
-                // ---- deferred to later milestones: emit a marker and fall through ----------
                 case SendStmt send:
-                    Todo(sb, indent, "M3", $"send {EventName(send.Evt)} to another machine");
+                    // Async cast routed through the runtime, which resolves the target id to a pid
+                    // and drops the send if the target has halted. `this`/ids are opaque machine refs.
+                    Line(sb, indent,
+                        $"PRuntime.send_event(data.__id__, {EmitExpr(send.MachineExpr)}, {EmitEventExpr(send.Evt)}, {PackArgs(send.Arguments)})");
                     break;
 
-                case CtorStmt _:
-                    Todo(sb, indent, "M3", "new MachineName(...) (spawn under the DynamicSupervisor)");
+                case CtorStmt ctor:
+                    // `new I(args)` with the resulting machine ref discarded.
+                    Line(sb, indent, EmitCtor(ctor.Interface, ctor.Arguments));
                     break;
 
+                // ---- deferred to later milestones: emit a marker and fall through ----------
                 case RaiseStmt raiseStmt:
                     Todo(sb, indent, "M4", $"raise {EventName(raiseStmt.Event)} (non-halt)");
                     break;
@@ -281,7 +290,7 @@ namespace Plang.Compiler.Backend.Elixir
         {
             var payload = gotoStmt.Payload != null ? EmitExpr(gotoStmt.Payload) : "nil";
             Line(sb, indent,
-                $"PRuntime.goto(@p_machine, {ElixirNames.Atom(currentState)}, {ElixirNames.Atom(gotoStmt.State.Name)}, data, {payload})");
+                $"PRuntime.goto(data.__id__, {ElixirNames.Atom(currentState)}, {ElixirNames.Atom(gotoStmt.State.Name)}, data, {payload})");
         }
 
         private void EmitAssign(StringBuilder sb, string indent, IPExpr location, IPExpr value)
@@ -299,6 +308,26 @@ namespace Plang.Compiler.Backend.Elixir
             }
 
             Line(sb, indent, AssignTo(location, EmitExpr(value)));
+        }
+
+        // `new I(args)` → a runtime create call returning the new machine's opaque id. The module is
+        // <Prefix>.<Machine> and the base name is the machine name (resolved from the interface).
+        private string EmitCtor(Interface iface, IReadOnlyList<IPExpr> args)
+        {
+            var name = resolveMachineName(iface);
+            return $"PRuntime.create({modulePrefix}.{name}, \"{name}\", {PackArgs(args)})";
+        }
+
+        // Packs a send/ctor argument list into a single payload term: nil for none, the bare value
+        // for one, an Elixir tuple for several (P's typechecker keeps this to 0 or 1 in practice).
+        private string PackArgs(IReadOnlyList<IPExpr> args)
+        {
+            switch (args.Count)
+            {
+                case 0: return "nil";
+                case 1: return EmitExpr(args[0]);
+                default: return "{" + string.Join(", ", args.Select(EmitExpr)) + "}";
+            }
         }
 
         private void EmitInsert(StringBuilder sb, string indent, InsertStmt insert)
@@ -374,6 +403,7 @@ namespace Plang.Compiler.Backend.Elixir
                         return $"data = %{{data | {fields[v.Variable]}: {value}}}";
                     }
 
+                    EnsureLocal(v.Variable);
                     localsUsed = true;
                     return $"locals = %{{locals | {locals[v.Variable]}: {value}}}";
 
@@ -422,8 +452,14 @@ namespace Plang.Compiler.Backend.Elixir
                     return ReadVar(v.Variable);
 
                 case ThisRefExpr _:
-                    // P's `this` is the machine's own identity; on the BEAM that is its pid.
-                    return "self()";
+                    // P's `this` is the machine's own identity: its opaque id (the registry key),
+                    // so a machine can pass itself as a send target. Kept pid-independent on purpose.
+                    return "data.__id__";
+
+                case CtorExpr ctor:
+                    // `new I(args)` as a value: the IR has hoisted it into its own temp assignment,
+                    // so it is evaluated exactly once here. Returns the created machine's id.
+                    return EmitCtor(ctor.Interface, ctor.Arguments);
 
                 case CloneExpr c:
                     return EmitExpr(c.Term);
@@ -598,8 +634,22 @@ namespace Plang.Compiler.Backend.Elixir
                 return $"data.{fields[v]}";
             }
 
+            EnsureLocal(v);
             localsUsed = true;
             return $"locals.{locals[v]}";
+        }
+
+        // A variable that is neither a machine field nor one of this handler's params/locals is a
+        // global/param (test parameters and the like) — out of scope until a later milestone. Raise
+        // the same signal an unsupported expression does, so the statement degrades to a TODO marker
+        // instead of crashing the whole compile on the missing allocator entry.
+        private void EnsureLocal(Variable v)
+        {
+            if (!locals.Contains(v))
+            {
+                throw new System.NotImplementedException(
+                    $"Elixir backend: variable '{v.Name}' (role {v.Role}) is not a machine field or handler local; globals/params are not yet supported.");
+            }
         }
 
         // The accumulator threaded through control flow: machine fields always, plus locals when the
@@ -628,6 +678,21 @@ namespace Plang.Compiler.Backend.Elixir
                 VariableAccessExpr varAccess when eventVars.TryGetValue(varAccess.Variable, out var ev) => ev,
                 _ => null
             };
+        }
+
+        // The event-name atom for a send/raise position. The IR hoists an event reference into a
+        // temporary whose assignment EmitAssign drops (recording it in eventVars instead, for the
+        // halt lowering), so a plain EmitExpr of that temp would read a nil local. Resolve through
+        // eventVars first; fall back to EmitExpr for a genuinely dynamic event-typed value.
+        private string EmitEventExpr(IPExpr expr)
+        {
+            var ev = ResolveEvent(expr);
+            if (ev != null)
+            {
+                return ev.IsHaltEvent ? ":halt" : ElixirNames.Atom(ev.Name);
+            }
+
+            return EmitExpr(expr);
         }
 
         // Best-effort event name for a TODO marker; falls back to a placeholder when the event is
