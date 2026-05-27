@@ -234,6 +234,10 @@ end
                     case EventGotoState gotoState:
                         sb.Append($"  def handle_event(:cast, {{:p_event, :{EventAtom(ev.Name)}, _payload}}, :{atom}, data) do\n");
                         sb.Append($"    PRuntime.dequeued(@p_machine, :{atom}, :{EventAtom(ev.Name)})\n");
+                        if (gotoState.TransitionFunction != null)
+                        {
+                            sb.Append($"    # TODO(M2+): transition function on goto to {gotoState.Target.Name} is not yet run\n");
+                        }
                         sb.Append($"    PRuntime.goto(@p_machine, :{atom}, :{StateAtom(gotoState.Target.Name)}, data)\n");
                         sb.Append("  end\n\n");
                         break;
@@ -277,6 +281,10 @@ end
                             break;
 
                         case GotoStmt gotoStmt:
+                            if (gotoStmt.Payload != null)
+                            {
+                                sb.Append($"{indent}# TODO(M2+): goto payload to {gotoStmt.State.Name} is dropped\n");
+                            }
                             sb.Append($"{indent}PRuntime.goto(@p_machine, :{StateAtom(state.Name)}, :{StateAtom(gotoStmt.State.Name)}, data)\n");
                             terminal = true;
                             break;
