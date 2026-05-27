@@ -25,8 +25,12 @@ namespace Plang.Compiler.Backend.Elixir
     /// cross-machine sends resolve targets by opaque id through the registry.
     ///
     /// M4 (defer, raise, ignore): <c>defer E</c> postpones the event, <c>ignore E</c> drops it, and a
-    /// non-halt <c>raise E</c> re-delivers <c>E</c> front-of-queue. Specs and foreign code arrive in
-    /// later milestones.
+    /// non-halt <c>raise E</c> re-delivers <c>E</c> front-of-queue.
+    ///
+    /// M5 (specs and announce): each P <c>spec</c> becomes a passive <c>:gen_statem</c> monitor that
+    /// registers its observed events in <c>init</c> and is started statically by the supervisor
+    /// (before any machine). <c>announce</c> and every machine <c>send</c> fan out synchronously to
+    /// the observing specs via the runtime. Foreign code arrives in a later milestone.
     ///
     /// Like PObserve, this backend has no compilation stage: the generated mix project is meant
     /// to be consumed as a dependency by a host application, which builds it with the standard
@@ -49,9 +53,13 @@ namespace Plang.Compiler.Backend.Elixir
             var modulePrefix = ModulePrefix(job);
             var appName = SnakeCase(modulePrefix);
 
-            // Non-spec machines are the executable state machines; specs become passive monitors
-            // in a later milestone (M5) and are skipped here.
+            // Non-spec machines are the executable state machines. Specs are passive monitors
+            // (separate :gen_statem processes that only observe events) — generated below too, but
+            // started statically and registered with the runtime's fan-out rather than created.
             var machines = globalScope.Machines.Where(m => !m.IsSpec).ToList();
+            var specs = globalScope.Machines.Where(m => m.IsSpec).ToList();
+
+            WarnOnLivenessStates(job, specs);
 
             // Named-tuple shapes are deduped across the whole program and emitted as struct modules,
             // so collection happens before any machine that constructs/defaults one is generated.
@@ -82,7 +90,7 @@ namespace Plang.Compiler.Backend.Elixir
             var files = new List<CompiledFile>
             {
                 GenerateMixExs(modulePrefix, appName),
-                GenerateSupervisor(modulePrefix, appName, rootMachines)
+                GenerateSupervisor(modulePrefix, appName, specs, rootMachines)
             };
 
             var typesFile = types.EmitTypesFile(appName);
@@ -92,7 +100,35 @@ namespace Plang.Compiler.Backend.Elixir
             }
 
             files.AddRange(machines.Select(m => GenerateMachine(modulePrefix, appName, m, types, ResolveMachineName)));
+            files.AddRange(specs.Select(m => GenerateMachine(modulePrefix, appName, m, types, ResolveMachineName)));
             return files;
+        }
+
+        /// <summary>
+        /// Warns when a spec uses <c>hot</c>/<c>cold</c> states. Those temperatures express a
+        /// <em>liveness</em> obligation, which is untimed and has no finite witness — so this runtime
+        /// backend cannot check it and currently ignores the annotation entirely (hot/cold compile to
+        /// ordinary states). Without a warning the liveness property would silently evaporate; a timed
+        /// "bounded-response" approximation is planned (DESIGN.md M8).
+        /// </summary>
+        private static void WarnOnLivenessStates(ICompilerConfiguration job, IEnumerable<Machine> specs)
+        {
+            foreach (var spec in specs)
+            {
+                var livenessStates = spec.States
+                    .Where(s => s.Temperature != StateTemperature.Warm)
+                    .Select(s => s.Name)
+                    .ToList();
+
+                if (livenessStates.Count > 0)
+                {
+                    job.Output.WriteWarning(
+                        $"[Elixir backend] spec '{spec.Name}' uses hot/cold state(s) " +
+                        $"[{string.Join(", ", livenessStates)}]: the Elixir runtime backend does not check " +
+                        "liveness, so these temperature annotations are ignored (see DESIGN.md M8). " +
+                        "Safety assertions are still checked.");
+                }
+            }
         }
 
         private static CompiledFile GenerateMixExs(string modulePrefix, string appName)
@@ -128,14 +164,20 @@ end
             return file;
         }
 
-        private static CompiledFile GenerateSupervisor(string modulePrefix, string appName, IReadOnlyCollection<Machine> rootMachines)
+        private static CompiledFile GenerateSupervisor(string modulePrefix, string appName,
+            IReadOnlyCollection<Machine> specs, IReadOnlyCollection<Machine> rootMachines)
         {
             // The DynamicSupervisor is always present (machines created with `new` are spawned under
             // it via PRuntime.Spawner) and listed first, so it is running before any root machine's
-            // entry handler can create children. Root machines are started with their own name as id.
-            var roots = string.Join(",\n",
-                rootMachines.Select(m => $"      {{{modulePrefix}.{m.Name}, %{{id: \"{m.Name}\", args: nil}}}}"));
-            var rootBlock = roots.Length > 0 ? ",\n" + roots : "";
+            // entry handler can create children.
+            //
+            // Specs are started next, before any root machine — each spec registers what it observes
+            // in its `init` (synchronously, before its start_link returns), so every observed event
+            // is mirrored to it from the first machine send onward. Both specs and root machines are
+            // started with their own name as id.
+            string Child(Machine m) => $"      {{{modulePrefix}.{m.Name}, %{{id: \"{m.Name}\", args: nil}}}}";
+            var statics = string.Join(",\n", specs.Concat(rootMachines).Select(Child));
+            var rootBlock = statics.Length > 0 ? ",\n" + statics : "";
 
             var file = new CompiledFile(Path.Combine("lib", appName, "supervisor.ex"));
             file.Stream.Write(
@@ -195,11 +237,21 @@ end
                 new[] { "__id__: nil" }.Concat(
                     machine.Fields.Select(f => $"{fields[f]}: {types.Default(f.Type)}")));
 
+            // A spec is a passive monitor: same :gen_statem shape, but on init it registers the set
+            // of events it observes with the runtime's fan-out, and it is never created with `new`.
+            var kind = machine.IsSpec ? "spec" : "machine";
+            var observesLine = "";
+            if (machine.IsSpec)
+            {
+                var events = string.Join(", ", machine.Observes.Events.Select(e => ElixirNames.Atom(e.Name)));
+                observesLine = $"\n    PRuntime.observes(id, [{events}])";
+            }
+
             var sb = new StringBuilder();
             sb.Append(
 $@"defmodule {modulePrefix}.{machine.Name} do
   @moduledoc """"""
-  Generated from P machine `{machine.Name}` by the P compiler's Elixir backend. Do not edit.
+  Generated from P {kind} `{machine.Name}` by the P compiler's Elixir backend. Do not edit.
 
   Encoded as a :gen_statem in handle_event_function + state_enter mode. P `entry` runs as a
   synthetic `{{:__entry__, payload}}` internal event queued on arrival, so entry executes in the
@@ -210,11 +262,10 @@ $@"defmodule {modulePrefix}.{machine.Name} do
 
   defstruct [{structFields}]
 
-  # :transient — a P machine that halts (stops :normal) is not restarted; only an abnormal
-  # crash would restart it. P machines halt or live forever (see DESIGN.md, Open Question 3).
+  # {(machine.IsSpec ? ":temporary — a spec is a passive monitor; if it halts or fails an assertion\n  # (a safety violation, raised as PRuntime.SafetyViolation) it stays down, never restarted." : ":transient — a P machine that halts (stops :normal) is not restarted; only an abnormal\n  # crash would restart it. P machines halt or live forever (see DESIGN.md, Open Question 3).")}
   @doc false
   def child_spec(arg) do
-    %{{id: __MODULE__, start: {{__MODULE__, :start_link, [arg]}}, restart: :transient}}
+    %{{id: __MODULE__, start: {{__MODULE__, :start_link, [arg]}}, restart: {(machine.IsSpec ? ":temporary" : ":transient")}}}
   end
 
   # `arg` is %{{id: opaque_id, args: entry_payload}}: a root machine gets it from the supervisor,
@@ -229,7 +280,7 @@ $@"defmodule {modulePrefix}.{machine.Name} do
 
   @impl true
   def init(%{{id: id, args: args}}) do
-    PRuntime.created(id)
+    PRuntime.created(id){observesLine}
     {{:ok, {ElixirNames.Atom(machine.StartState.Name)}, %__MODULE__{{__id__: id}}, [{{:next_event, :internal, {{:__entry__, args}}}}]}}
   end
 

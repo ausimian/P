@@ -28,8 +28,9 @@ namespace Plang.Compiler.Backend.Elixir
     /// a <c>goto</c>/<c>halt</c>/<c>raise</c>, a tail <c>if</c> whose branches each return, or a
     /// fall-through <c>{:keep_state, data}</c>. A non-halt <c>raise E</c> is terminal too: it
     /// produces a <c>{:keep_state, …, [{:next_event, :internal, …}]}</c> return that queues
-    /// <c>E</c> front-of-queue. Constructs from later milestones (announce, loops, function calls)
-    /// emit a TODO marker and fall through.</para>
+    /// <c>E</c> front-of-queue. <c>announce E, payload</c> fans out synchronously to the spec
+    /// monitors observing <c>E</c> (via the runtime). Constructs from later milestones (loops,
+    /// function calls) emit a TODO marker and fall through.</para>
     /// </summary>
     internal sealed class ElixirFunctionEmitter
     {
@@ -234,7 +235,11 @@ namespace Plang.Compiler.Backend.Elixir
                     break;
 
                 case AssertStmt assert:
-                    Line(sb, indent, $"if !({EmitExpr(assert.Assertion)}), do: raise({EmitExpr(assert.Message)})");
+                    // P `assert` is a safety check; route it through the runtime so a failure is
+                    // recorded/logged and raised as a distinct PRuntime.SafetyViolation (rather than a
+                    // bare string raise), keeping violation-handling out of generated code.
+                    Line(sb, indent,
+                        $"PRuntime.assert(data.__id__, {EmitExpr(assert.Assertion)}, {EmitExpr(assert.Message)})");
                     break;
 
                 case SendStmt send:
@@ -257,10 +262,15 @@ namespace Plang.Compiler.Backend.Elixir
                         $"PRuntime.raise_event(data.__id__, {ElixirNames.Atom(currentState)}, {EmitEventExpr(raiseStmt.Event)}, {PackArgs(raiseStmt.Payload)}, data)");
                     return;
 
-                // ---- deferred to later milestones: emit a marker and fall through ----------
                 case AnnounceStmt announce:
-                    Todo(sb, indent, "M5", $"announce {EventName(announce.Event)}");
+                    // `announce E, payload` notifies spec monitors only (never a machine). The
+                    // runtime fans out synchronously to every spec observing E and records the trace.
+                    var announcePayload = announce.Payload != null ? EmitExpr(announce.Payload) : "nil";
+                    Line(sb, indent,
+                        $"PRuntime.announce(data.__id__, {EmitEventExpr(announce.Event)}, {announcePayload})");
                     break;
+
+                // ---- deferred to later milestones: emit a marker and fall through ----------
 
                 case WhileStmt _:
                 case ForeachStmt _:

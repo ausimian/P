@@ -1,0 +1,8 @@
+<!-- P project for the Elixir backend M5 fixture (specs, fan-out, and announce). -->
+<Project>
+<ProjectName>M5Demo</ProjectName>
+<InputFiles>
+	<PFile>./ReqResp.p</PFile>
+</InputFiles>
+<OutputDir>./PGenerated/</OutputDir>
+</Project>
