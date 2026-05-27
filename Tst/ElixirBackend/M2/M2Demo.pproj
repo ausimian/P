@@ -1,0 +1,8 @@
+<!-- P project for the Elixir backend M2 fixture (payloads and the type system). -->
+<Project>
+<ProjectName>M2Demo</ProjectName>
+<InputFiles>
+	<PFile>./Store.p</PFile>
+</InputFiles>
+<OutputDir>./PGenerated/</OutputDir>
+</Project>

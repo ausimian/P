@@ -2,13 +2,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using Plang.Compiler.Backend.ASTExt;
 using Plang.Compiler.TypeChecker;
-using Plang.Compiler.TypeChecker.AST;
 using Plang.Compiler.TypeChecker.AST.Declarations;
-using Plang.Compiler.TypeChecker.AST.Expressions;
 using Plang.Compiler.TypeChecker.AST.States;
-using Plang.Compiler.TypeChecker.AST.Statements;
 
 namespace Plang.Compiler.Backend.Elixir
 {
@@ -18,8 +14,13 @@ namespace Plang.Compiler.Backend.Elixir
     /// only with <em>running</em> a P design, not verifying it.
     ///
     /// M1 (walking skeleton): each P machine becomes a <c>:gen_statem</c> module; the generated
-    /// <c>&lt;Prefix&gt;.Supervisor</c> starts the (non-spec) machines. Payloads, the type system,
-    /// cross-machine sends, defer/ignore, and specs arrive in later milestones.
+    /// <c>&lt;Prefix&gt;.Supervisor</c> starts the (non-spec) machines.
+    ///
+    /// M2 (payloads and the type system): event/entry payloads are bound and threaded; machine
+    /// fields and locals are supported; all primitive types, tuples, named tuples (each distinct
+    /// shape becomes a generated <c>defstruct</c> module under <c>&lt;Prefix&gt;.Types</c>) and
+    /// seq/set/map map onto built-in Elixir terms. Cross-machine sends, defer/ignore, specs and
+    /// foreign code arrive in later milestones.
     ///
     /// Like PObserve, this backend has no compilation stage: the generated mix project is meant
     /// to be consumed as a dependency by a host application, which builds it with the standard
@@ -31,6 +32,12 @@ namespace Plang.Compiler.Backend.Elixir
     /// </summary>
     public class ElixirCodeGenerator : ICodeGenerator
     {
+        public bool HasCompilationStage => false;
+
+        public void Compile(ICompilerConfiguration job)
+        {
+        }
+
         public IEnumerable<CompiledFile> GenerateCode(ICompilerConfiguration job, Scope globalScope)
         {
             var modulePrefix = ModulePrefix(job);
@@ -39,6 +46,11 @@ namespace Plang.Compiler.Backend.Elixir
             // Non-spec machines are the executable state machines; specs become passive monitors
             // in a later milestone (M5) and are skipped here.
             var machines = globalScope.Machines.Where(m => !m.IsSpec).ToList();
+
+            // Named-tuple shapes are deduped across the whole program and emitted as struct modules,
+            // so collection happens before any machine that constructs/defaults one is generated.
+            var types = new ElixirTypeContext(modulePrefix);
+            types.CollectFrom(globalScope);
 
             // WriteFile (DefaultCompilerOutput) does not create intermediate directories, and the
             // generated files live under lib/<app>/. Create that directory now, before the
@@ -52,7 +64,13 @@ namespace Plang.Compiler.Backend.Elixir
                 GenerateSupervisor(modulePrefix, appName, machines)
             };
 
-            files.AddRange(machines.Select(m => GenerateMachine(modulePrefix, appName, m)));
+            var typesFile = types.EmitTypesFile(appName);
+            if (typesFile != null)
+            {
+                files.Add(typesFile);
+            }
+
+            files.AddRange(machines.Select(m => GenerateMachine(modulePrefix, appName, m, types)));
             return files;
         }
 
@@ -81,7 +99,7 @@ $@"defmodule {modulePrefix}.MixProject do
 
   defp deps do
     [
-      {{:p_runtime, github: ""ausimian/p_runtime""}}
+      {{:p_runtime, github: ""ausimian/p_runtime"", ref: ""85d4291f00612a52beada10aef9a99f45363fa60""}}
     ]
   end
 end
@@ -130,11 +148,24 @@ end
         /// PascalCase (e.g. <c>Init</c>), which is not a valid Elixir function name. A single
         /// <c>handle_event/4</c> matching on the state atom sidesteps that entirely.
         ///
-        /// P's <c>entry</c> runs as a synthetic <c>:__entry__</c> internal event queued on arrival
-        /// (from <c>init</c> and from every <c>goto</c>), so entry executes in the new state.
+        /// Machine fields become the <c>defstruct</c> carried as the <c>:gen_statem</c> data.
+        /// P's <c>entry</c> runs as a synthetic <c>{:__entry__, payload}</c> internal event queued on
+        /// arrival (from <c>init</c> and from every <c>goto</c>), so entry executes in the new state
+        /// and any goto payload reaches it.
         /// </summary>
-        private static CompiledFile GenerateMachine(string modulePrefix, string appName, Machine machine)
+        private static CompiledFile GenerateMachine(string modulePrefix, string appName, Machine machine, ElixirTypeContext types)
         {
+            // Stable, unique Elixir keys for the machine's fields; shared between the defstruct here
+            // and every field read/write the emitter produces.
+            var fields = new NameAllocator();
+            foreach (var field in machine.Fields)
+            {
+                fields.Allocate(field);
+            }
+
+            var structFields = string.Join(", ",
+                machine.Fields.Select(f => $"{fields[f]}: {types.Default(f.Type)}"));
+
             var sb = new StringBuilder();
             sb.Append(
 $@"defmodule {modulePrefix}.{machine.Name} do
@@ -142,14 +173,15 @@ $@"defmodule {modulePrefix}.{machine.Name} do
   Generated from P machine `{machine.Name}` by the P compiler's Elixir backend. Do not edit.
 
   Encoded as a :gen_statem in handle_event_function + state_enter mode. P `entry` runs as a
-  synthetic `:__entry__` internal event queued on arrival, so entry executes in the new state
-  across every transition.
+  synthetic `{{:__entry__, payload}}` internal event queued on arrival, so entry executes in the
+  new state across every transition. Machine fields are carried in the struct below; handler
+  locals are threaded through a `locals` map.
   """"""
   @behaviour :gen_statem
 
   @p_machine ""{machine.Name}""
 
-  defstruct []
+  defstruct [{structFields}]
 
   # :transient — a P machine that halts (stops :normal) is not restarted; only an abnormal
   # crash would restart it. P machines halt or live forever (see DESIGN.md, Open Question 3).
@@ -169,9 +201,9 @@ $@"defmodule {modulePrefix}.{machine.Name} do
   def callback_mode, do: [:handle_event_function, :state_enter]
 
   @impl true
-  def init(_args) do
+  def init(args) do
     PRuntime.created(@p_machine)
-    {{:ok, :{StateAtom(machine.StartState.Name)}, %__MODULE__{{}}, [{{:next_event, :internal, :__entry__}}]}}
+    {{:ok, {ElixirNames.Atom(machine.StartState.Name)}, %__MODULE__{{}}, [{{:next_event, :internal, {{:__entry__, args}}}}]}}
   end
 
   @impl true
@@ -179,7 +211,7 @@ $@"defmodule {modulePrefix}.{machine.Name} do
 
             foreach (var state in machine.States)
             {
-                EmitState(sb, state);
+                EmitState(sb, machine, state, fields, types);
             }
 
             sb.Append(
@@ -194,144 +226,76 @@ end
             return file;
         }
 
-        private static void EmitState(StringBuilder sb, State state)
+        private static void EmitState(StringBuilder sb, Machine machine, State state, NameAllocator fields, ElixirTypeContext types)
         {
-            var atom = StateAtom(state.Name);
+            var atom = ElixirNames.Atom(state.Name);
+            const string indent = "    ";
 
             sb.Append($"\n  # ---- state {state.Name} ----\n");
 
             // state_enter callback.
-            sb.Append($"  def handle_event(:enter, _old_state, :{atom}, _data) do\n");
-            sb.Append($"    PRuntime.entered(@p_machine, :{atom})\n");
+            sb.Append($"  def handle_event(:enter, _old_state, {atom}, _data) do\n");
+            sb.Append($"    PRuntime.entered(@p_machine, {atom})\n");
             sb.Append("    :keep_state_and_data\n");
             sb.Append("  end\n\n");
 
-            // entry handler, encoded as the :__entry__ internal event.
+            // entry handler, encoded as the {:__entry__, payload} internal event.
             if (state.Entry != null)
             {
-                sb.Append($"  def handle_event(:internal, :__entry__, :{atom}, data) do\n");
-                sb.Append(BuildHandlerBody(state, state.Entry, "    "));
+                var emitter = new ElixirFunctionEmitter(machine, fields, state.Entry, types);
+                var body = emitter.Render(indent, tail: true, state.Name);
+                sb.Append($"  def handle_event(:internal, {{:__entry__, {Pattern(emitter)}}}, {atom}, data) do\n");
+                sb.Append(body);
                 sb.Append("  end\n\n");
             }
             else
             {
-                sb.Append($"  def handle_event(:internal, :__entry__, :{atom}, _data), do: :keep_state_and_data\n\n");
+                sb.Append($"  def handle_event(:internal, {{:__entry__, _payload}}, {atom}, _data), do: :keep_state_and_data\n\n");
             }
 
             // on E ... handlers.
             foreach (var handler in state.AllEventHandlers)
             {
                 var ev = handler.Key;
+                var evAtom = ElixirNames.Atom(ev.Name);
                 switch (handler.Value)
                 {
                     case EventDoAction doAction:
-                        sb.Append($"  def handle_event(:cast, {{:p_event, :{EventAtom(ev.Name)}, _payload}}, :{atom}, data) do\n");
-                        sb.Append($"    PRuntime.dequeued(@p_machine, :{atom}, :{EventAtom(ev.Name)})\n");
-                        sb.Append(BuildHandlerBody(state, doAction.Target, "    "));
+                    {
+                        var emitter = new ElixirFunctionEmitter(machine, fields, doAction.Target, types);
+                        var body = emitter.Render(indent, tail: true, state.Name);
+                        sb.Append($"  def handle_event(:cast, {{:p_event, {evAtom}, {Pattern(emitter)}}}, {atom}, data) do\n");
+                        sb.Append($"    PRuntime.dequeued(@p_machine, {atom}, {evAtom})\n");
+                        sb.Append(body);
                         sb.Append("  end\n\n");
                         break;
+                    }
 
                     case EventGotoState gotoState:
-                        sb.Append($"  def handle_event(:cast, {{:p_event, :{EventAtom(ev.Name)}, _payload}}, :{atom}, data) do\n");
-                        sb.Append($"    PRuntime.dequeued(@p_machine, :{atom}, :{EventAtom(ev.Name)})\n");
-                        if (gotoState.TransitionFunction != null)
-                        {
-                            sb.Append($"    # TODO(M2+): transition function on goto to {gotoState.Target.Name} is not yet run\n");
-                        }
-                        sb.Append($"    PRuntime.goto(@p_machine, :{atom}, :{StateAtom(gotoState.Target.Name)}, data)\n");
+                    {
+                        var fn = gotoState.TransitionFunction;
+                        var emitter = fn != null ? new ElixirFunctionEmitter(machine, fields, fn, types) : null;
+                        var body = emitter?.Render(indent, tail: false, state.Name) ?? "";
+                        sb.Append($"  def handle_event(:cast, {{:p_event, {evAtom}, {Pattern(emitter)}}}, {atom}, data) do\n");
+                        sb.Append($"    PRuntime.dequeued(@p_machine, {atom}, {evAtom})\n");
+                        sb.Append(body);
+                        sb.Append($"    PRuntime.goto(@p_machine, {atom}, {ElixirNames.Atom(gotoState.Target.Name)}, data, nil)\n");
                         sb.Append("  end\n\n");
                         break;
+                    }
 
                     case EventDefer _:
                     case EventIgnore _:
                         sb.Append($"  # TODO(M4): {handler.Value.GetType().Name} for {ev.Name}\n");
-                        sb.Append($"  def handle_event(:cast, {{:p_event, :{EventAtom(ev.Name)}, _payload}}, :{atom}, _data), do: :keep_state_and_data\n\n");
+                        sb.Append($"  def handle_event(:cast, {{:p_event, {evAtom}, _payload}}, {atom}, _data), do: :keep_state_and_data\n\n");
                         break;
                 }
             }
         }
 
-        /// <summary>
-        /// Emits the body of an entry/handler function as the tail of a <c>handle_event</c> clause.
-        /// M1 supports <c>goto</c> and <c>raise halt</c> (both terminal, producing the gen_statem
-        /// return). Anything else is emitted as a TODO comment; if no terminal statement is present
-        /// the clause falls through to <c>:keep_state_and_data</c>.
-        ///
-        /// The front-end lowers expressions through temporaries, so <c>raise halt</c> arrives as
-        /// <c>tmp = halt; raise tmp;</c>. We track temporaries assigned an event reference so a
-        /// later <c>raise tmp</c> can be resolved back to its event (and recognised as halt).
-        /// </summary>
-        private static string BuildHandlerBody(State state, Function fn, string indent)
-        {
-            var sb = new StringBuilder();
-            var terminal = false;
-            var eventVars = new Dictionary<Variable, Event>();
-
-            if (fn?.Body != null)
-            {
-                foreach (var stmt in fn.Body.Statements)
-                {
-                    switch (stmt)
-                    {
-                        // tmp = <event>: remember the binding, emit nothing. The value is wrapped
-                        // in a CloneExpr (deep copy) by the front-end, hence the unwrap.
-                        case AssignStmt assign
-                            when assign.Location is VariableAccessExpr target && Unwrap(assign.Value) is EventRefExpr eventRef:
-                            eventVars[target.Variable] = eventRef.Value;
-                            break;
-
-                        case GotoStmt gotoStmt:
-                            if (gotoStmt.Payload != null)
-                            {
-                                sb.Append($"{indent}# TODO(M2+): goto payload to {gotoStmt.State.Name} is dropped\n");
-                            }
-                            sb.Append($"{indent}PRuntime.goto(@p_machine, :{StateAtom(state.Name)}, :{StateAtom(gotoStmt.State.Name)}, data)\n");
-                            terminal = true;
-                            break;
-
-                        case RaiseStmt raiseStmt when ResolveEvent(raiseStmt.Event, eventVars) is { IsHaltEvent: true }:
-                            sb.Append($"{indent}PRuntime.halt(@p_machine, :{StateAtom(state.Name)}, data)\n");
-                            terminal = true;
-                            break;
-
-                        default:
-                            sb.Append($"{indent}# TODO(M2+): unsupported statement {stmt.GetType().Name}\n");
-                            break;
-                    }
-                }
-            }
-
-            if (!terminal)
-            {
-                sb.Append($"{indent}:keep_state_and_data\n");
-            }
-
-            return sb.ToString();
-        }
-
-        /// <summary>
-        /// Resolves an event-typed expression to its <see cref="Event"/>: either a direct event
-        /// reference, or a temporary previously assigned one. Returns null if it cannot be resolved
-        /// statically (e.g. a computed event), which M1 does not yet support.
-        /// </summary>
-        private static Event ResolveEvent(IPExpr expr, IReadOnlyDictionary<Variable, Event> eventVars)
-        {
-            return Unwrap(expr) switch
-            {
-                EventRefExpr eventRef => eventRef.Value,
-                VariableAccessExpr varAccess when eventVars.TryGetValue(varAccess.Variable, out var ev) => ev,
-                _ => null
-            };
-        }
-
-        // The front-end wraps copied values in a CloneExpr; strip it to inspect the underlying term.
-        private static IPExpr Unwrap(IPExpr expr) => expr is CloneExpr clone ? clone.Term : expr;
-
-        // P state/event names are PascalCase identifiers; quoting keeps the emitted atom valid for
-        // any name (e.g. names that aren't lowercase) without special-casing.
-        private static string StateAtom(string name) => $"\"{name}\"";
-
-        private static string EventAtom(string name) => $"\"{name}\"";
+        // Pattern for the payload position of a clause head: bind it to `payload` only when the
+        // rendered body actually uses it (the emitter seeds `locals` from it), otherwise ignore it.
+        private static string Pattern(ElixirFunctionEmitter emitter) => emitter?.PayloadUsed == true ? "payload" : "_payload";
 
         /// <summary>
         /// Derives an Elixir module alias (PascalCase, e.g. <c>ClientServer</c>) from the P project

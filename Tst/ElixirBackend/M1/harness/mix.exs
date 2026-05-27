@@ -2,8 +2,8 @@ defmodule M1Harness.MixProject do
   use Mix.Project
 
   # Host project that drives the generated M1 program from ExUnit. It depends on the generated
-  # mix lib (path, under ../PGenerated/Elixir) and on p_runtime from GitHub — the same source the
-  # generated lib declares.
+  # mix lib (path, under ../PGenerated/Elixir) and on p_runtime pinned to the exact commit the
+  # generated lib declares (overriding the generated lib's identical declaration).
   #
   # Run `p compile --mode elixir` in the parent directory first, then `mix test` here
   # (the first run fetches p_runtime from GitHub).
@@ -22,8 +22,7 @@ defmodule M1Harness.MixProject do
 
   defp deps do
     [
-      # Same GitHub source the generated lib declares, so the two converge.
-      {:p_runtime, github: "ausimian/p_runtime"},
+      {:p_runtime, github: "ausimian/p_runtime", ref: "85d4291f00612a52beada10aef9a99f45363fa60", override: true},
       {:m1_demo, path: "../PGenerated/Elixir"}
     ]
   end
