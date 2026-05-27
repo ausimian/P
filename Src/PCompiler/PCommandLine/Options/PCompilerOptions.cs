@@ -16,7 +16,7 @@ namespace Plang.Options
         /// must stay in sync (a mode that is allowed but unmapped would crash at runtime).
         /// </summary>
         internal static readonly string[] CompilerModes =
-            { "bugfinding", "pchecker", "pex", "pobserve", "verification", "pverifier" };
+            { "bugfinding", "pchecker", "pex", "pobserve", "verification", "pverifier", "elixir" };
 
         /// <summary>
         /// Maps a <c>--mode</c> value to its target backend. Throws if the mode is not one
@@ -36,6 +36,8 @@ namespace Plang.Options
                 case "verification":
                 case "pverifier":
                     return CompilerOutput.PVerifier;
+                case "elixir":
+                    return CompilerOutput.Elixir;
                 default:
                     throw new Exception($"Unexpected mode: '{mode}'");
             }

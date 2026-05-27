@@ -254,9 +254,12 @@ namespace Plang.Parser
                         case "pverifier":
                             outputLanguages.Add(CompilerOutput.PVerifier);
                             break;
+                        case "elixir":
+                            outputLanguages.Add(CompilerOutput.Elixir);
+                            break;
                         default:
                             throw new CommandlineParsingError(
-                                $"Expected PChecker, PEx, PObserve, or PVerifier as target, received {projectXml.Element("Target")?.Value}");
+                                $"Expected PChecker, PEx, PObserve, PVerifier, or Elixir as target, received {projectXml.Element("Target")?.Value}");
                     }
                 }
             }

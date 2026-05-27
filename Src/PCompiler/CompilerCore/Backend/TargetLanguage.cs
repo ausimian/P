@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using Plang.Compiler.Backend.CSharp;
+using Plang.Compiler.Backend.Elixir;
 using Plang.Compiler.Backend.Java;
 using Plang.Compiler.Backend.PEx;
 using Plang.Compiler.Backend.PVerifier;
@@ -17,6 +18,7 @@ namespace Plang.Compiler.Backend
             RegisterCodeGenerator(CompilerOutput.PObserve, new PObserveCodeGenerator());
             RegisterCodeGenerator(CompilerOutput.PVerifier, new PVerifierCodeGenerator());
             RegisterCodeGenerator(CompilerOutput.PEx, new PExCodeGenerator());
+            RegisterCodeGenerator(CompilerOutput.Elixir, new ElixirCodeGenerator());
         }
 
         private static void RegisterCodeGenerator(CompilerOutput name, ICodeGenerator generator)
