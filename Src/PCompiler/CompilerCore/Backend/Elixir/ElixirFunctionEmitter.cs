@@ -29,8 +29,10 @@ namespace Plang.Compiler.Backend.Elixir
     /// fall-through <c>{:keep_state, data}</c>. A non-halt <c>raise E</c> is terminal too: it
     /// produces a <c>{:keep_state, …, [{:next_event, :internal, …}]}</c> return that queues
     /// <c>E</c> front-of-queue. <c>announce E, payload</c> fans out synchronously to the spec
-    /// monitors observing <c>E</c> (via the runtime). Constructs from later milestones (loops,
-    /// function calls) emit a TODO marker and fall through.</para>
+    /// monitors observing <c>E</c> (via the runtime). A call to a <em>foreign</em> P function
+    /// (declared with no body) maps to <c>PForeign.&lt;name&gt;(args)</c>, dispatching to a
+    /// host-written module (M6). Constructs from later milestones (loops, calls to P functions
+    /// <em>with</em> bodies) emit a TODO marker and fall through.</para>
     /// </summary>
     internal sealed class ElixirFunctionEmitter
     {
@@ -280,11 +282,20 @@ namespace Plang.Compiler.Backend.Elixir
                     break;
 
                 case FunCallStmt funCall:
-                    Todo(sb, indent, "M6", $"call to P function {funCall.Function.Name}");
+                    if (funCall.Function.IsForeign)
+                    {
+                        // Foreign function called for effect; result (if any) discarded.
+                        Line(sb, indent, EmitForeignCall(funCall.Function, funCall.ArgsList));
+                        break;
+                    }
+
+                    // A P function with a body would need the machine's mutable data/locals threaded
+                    // through the call (it can read/write fields and send/raise); deferred.
+                    Todo(sb, indent, "M7+", $"call to P function {funCall.Function.Name}");
                     break;
 
                 case ReturnStmt _:
-                    Todo(sb, indent, "M6", "return from a P function");
+                    Todo(sb, indent, "M7+", "return from a P function");
                     break;
 
                 case SwapAssignStmt _:
@@ -333,6 +344,15 @@ namespace Plang.Compiler.Backend.Elixir
             var name = resolveMachineName(iface);
             return $"PRuntime.create({modulePrefix}.{name}, \"{name}\", {PackArgs(args)})";
         }
+
+        // A P `foreign` function (declared with no body) is implemented by the host in a hand-written
+        // `PForeign` module — the convention every Elixir foreign binding follows (DESIGN.md M6). A
+        // call maps directly to `PForeign.<name>(args)`: the arguments are passed positionally (a
+        // foreign function keeps its declared arity), not packed into one payload term the way a
+        // send/ctor is. The generated module declares `@compile {:no_warn_undefined, PForeign}` so the
+        // lib compiles before the host's PForeign exists; the call resolves at runtime.
+        private string EmitForeignCall(Function fn, IReadOnlyList<IPExpr> args) =>
+            $"PForeign.{ElixirNames.Identifier(fn.Name)}({string.Join(", ", args.Select(EmitExpr))})";
 
         // Packs a send/ctor argument list into a single payload term: nil for none, the bare value
         // for one, an Elixir tuple for several (P's typechecker keeps this to 0 or 1 in practice).
@@ -534,8 +554,13 @@ namespace Plang.Compiler.Backend.Elixir
                 case StringExpr s:
                     return EmitString(s);
 
+                case FunCallExpr call when call.Function.IsForeign:
+                    // Foreign function in value position. The IR has hoisted it into its own temp
+                    // assignment with atomic args, so it is evaluated exactly once here.
+                    return EmitForeignCall(call.Function, call.Arguments);
+
                 default:
-                    // FunCall/Ctor/Choose/Nondet and friends arrive in later milestones.
+                    // A call to a P function with a body, Choose/Nondet and friends arrive later.
                     throw new System.NotImplementedException(
                         $"Elixir backend (M2): expression {expr.GetType().Name} is not yet supported.");
             }

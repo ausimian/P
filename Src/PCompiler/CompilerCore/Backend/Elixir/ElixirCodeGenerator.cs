@@ -5,6 +5,7 @@ using System.Text;
 using Plang.Compiler.TypeChecker;
 using Plang.Compiler.TypeChecker.AST.Declarations;
 using Plang.Compiler.TypeChecker.AST.States;
+using Plang.Compiler.TypeChecker.Types;
 
 namespace Plang.Compiler.Backend.Elixir
 {
@@ -30,7 +31,12 @@ namespace Plang.Compiler.Backend.Elixir
     /// M5 (specs and announce): each P <c>spec</c> becomes a passive <c>:gen_statem</c> monitor that
     /// registers its observed events in <c>init</c> and is started statically by the supervisor
     /// (before any machine). <c>announce</c> and every machine <c>send</c> fan out synchronously to
-    /// the observing specs via the runtime. Foreign code arrives in a later milestone.
+    /// the observing specs via the runtime.
+    ///
+    /// M6 (foreign types and functions): a P <c>foreign</c> function (declared with no body) is called
+    /// as <c>PForeign.&lt;name&gt;(args)</c>, dispatching to a host-written module; foreign types are
+    /// opaque Elixir terms the generated code never inspects. A <c>FOREIGN.md</c> binding guide with a
+    /// ready-to-copy <c>PForeign</c> stub is emitted alongside the project.
     ///
     /// Like PObserve, this backend has no compilation stage: the generated mix project is meant
     /// to be consumed as a dependency by a host application, which builds it with the standard
@@ -81,6 +87,15 @@ namespace Plang.Compiler.Backend.Elixir
                 machines.SelectMany(m => m.Creates.Interfaces).Select(ResolveMachineName));
             var rootMachines = machines.Where(m => !created.Contains(m.Name)).ToList();
 
+            // Foreign functions (declared in P with no body) are implemented by the host in a
+            // hand-written `PForeign` module; foreign types are opaque Elixir terms the generated code
+            // never inspects. Generated machine modules call `PForeign.<fn>(args)` and we emit a
+            // FOREIGN.md stub + binding guide so the user knows exactly what to implement (M6).
+            var foreignFunctions = globalScope.GetAllMethods().Where(f => f.IsForeign).ToList();
+            var foreignTypes = globalScope.Typedefs
+                .Where(t => t.Type.Canonicalize() is ForeignType).ToList();
+            var hasForeign = foreignFunctions.Count > 0;
+
             // WriteFile (DefaultCompilerOutput) does not create intermediate directories, and the
             // generated files live under lib/<app>/. Create that directory now, before the
             // orchestrator writes the returned files. PObserve follows the same "touch the output
@@ -99,8 +114,13 @@ namespace Plang.Compiler.Backend.Elixir
                 files.Add(typesFile);
             }
 
-            files.AddRange(machines.Select(m => GenerateMachine(modulePrefix, appName, m, types, ResolveMachineName)));
-            files.AddRange(specs.Select(m => GenerateMachine(modulePrefix, appName, m, types, ResolveMachineName)));
+            if (foreignFunctions.Count > 0 || foreignTypes.Count > 0)
+            {
+                files.Add(GenerateForeignDoc(modulePrefix, foreignFunctions, foreignTypes));
+            }
+
+            files.AddRange(machines.Select(m => GenerateMachine(modulePrefix, appName, m, types, ResolveMachineName, hasForeign)));
+            files.AddRange(specs.Select(m => GenerateMachine(modulePrefix, appName, m, types, ResolveMachineName, hasForeign)));
             return files;
         }
 
@@ -220,7 +240,7 @@ end
         /// and any goto payload reaches it.
         /// </summary>
         private static CompiledFile GenerateMachine(string modulePrefix, string appName, Machine machine,
-            ElixirTypeContext types, System.Func<Interface, string> resolveMachineName)
+            ElixirTypeContext types, System.Func<Interface, string> resolveMachineName, bool hasForeign)
         {
             // Stable, unique Elixir keys for the machine's fields; shared between the defstruct here
             // and every field read/write the emitter produces.
@@ -239,6 +259,11 @@ end
 
             // A spec is a passive monitor: same :gen_statem shape, but on init it registers the set
             // of events it observes with the runtime's fan-out, and it is never created with `new`.
+            // When the program uses foreign functions, the generated lib is compiled before the host's
+            // hand-written PForeign module exists, so calls to it would warn as undefined. Suppress
+            // that: the call resolves at runtime against the host's module (DESIGN.md M6).
+            var foreignAttr = hasForeign ? "\n  @compile {:no_warn_undefined, PForeign}\n" : "";
+
             var kind = machine.IsSpec ? "spec" : "machine";
             var observesLine = "";
             if (machine.IsSpec)
@@ -259,7 +284,7 @@ $@"defmodule {modulePrefix}.{machine.Name} do
   locals are threaded through a `locals` map.
   """"""
   @behaviour :gen_statem
-
+{foreignAttr}
   defstruct [{structFields}]
 
   # {(machine.IsSpec ? ":temporary — a spec is a passive monitor; if it halts or fails an assertion\n  # (a safety violation, raised as PRuntime.SafetyViolation) it stays down, never restarted." : ":transient — a P machine that halts (stops :normal) is not restarted; only an abnormal\n  # crash would restart it. P machines halt or live forever (see DESIGN.md, Open Question 3).")}
@@ -387,6 +412,96 @@ end
         // Pattern for the payload position of a clause head: bind it to `payload` only when the
         // rendered body actually uses it (the emitter seeds `locals` from it), otherwise ignore it.
         private static string Pattern(ElixirFunctionEmitter emitter) => emitter?.PayloadUsed == true ? "payload" : "_payload";
+
+        /// <summary>
+        /// Emits <c>FOREIGN.md</c>: the binding guide for the program's foreign surface (M6). It lists
+        /// the foreign types (opaque Elixir terms the generated code never inspects) and contains a
+        /// ready-to-copy <c>PForeign</c> stub module — one raising function per foreign function, with
+        /// the P signature in a comment — that the host copies into its own <c>lib/</c> and fills in.
+        /// The generated machine modules call these as <c>PForeign.&lt;name&gt;(args)</c>.
+        /// </summary>
+        private static CompiledFile GenerateForeignDoc(string modulePrefix,
+            IReadOnlyCollection<Function> foreignFunctions, IReadOnlyCollection<TypeDef> foreignTypes)
+        {
+            var sb = new StringBuilder();
+            sb.Append(
+$@"# Foreign bindings for `{modulePrefix}`
+
+This P program uses **foreign types and functions** — pieces implemented outside P, by you,
+in Elixir. The generated code calls them through a single module named `PForeign`, the
+convention every Elixir foreign binding follows.
+
+Generated by the P compiler's Elixir backend. Regenerated on each compile — do not edit; copy
+the stub below into your host application instead.
+
+## What you must provide
+
+Define a `PForeign` module in your **host** application (e.g. `lib/p_foreign.ex`) implementing
+every function listed below. The generated library calls `PForeign.<name>(args)` at runtime, so
+the module only has to exist by the time you start the supervisor — it is intentionally not part
+of the generated library (which is regenerated on every compile).
+");
+
+            if (foreignTypes.Count > 0)
+            {
+                sb.Append(
+@"
+## Foreign types
+
+These P types are **opaque** to the generated code: it never constructs or inspects a value of
+one, it only passes it between your `PForeign` functions. You choose the Elixir representation
+(a struct, a map, a pid, a reference — anything). The generated code defaults an uninitialised
+foreign-typed field to `nil`.
+
+");
+                foreach (var t in foreignTypes)
+                {
+                    sb.Append($"- `{t.Name}`\n");
+                }
+            }
+
+            sb.Append(
+@"
+## `PForeign` stub
+
+Copy this module into your host app and implement each function. Each currently raises so an
+unimplemented binding fails loudly rather than silently returning `nil`.
+
+```elixir
+defmodule PForeign do
+  @moduledoc ""Hand-written foreign bindings for the generated P program.""
+");
+
+            foreach (var fn in foreignFunctions)
+            {
+                var elixirName = ElixirNames.Identifier(fn.Name);
+                var paramNames = fn.Signature.Parameters
+                    .Select(p => ElixirNames.Identifier(p.Name)).ToList();
+                var arity = paramNames.Count;
+
+                sb.Append($"\n  # P: {ForeignSignature(fn)}\n");
+                sb.Append($"  def {elixirName}({string.Join(", ", paramNames)}) do\n");
+                sb.Append($"    raise \"PForeign.{elixirName}/{arity} not implemented\"\n");
+                sb.Append("  end\n");
+            }
+
+            sb.Append("end\n```\n");
+
+            var file = new CompiledFile("FOREIGN.md");
+            file.Stream.Write(sb.ToString());
+            return file;
+        }
+
+        /// <summary>Renders a foreign function's P signature for the binding guide (names + P types).</summary>
+        private static string ForeignSignature(Function fn)
+        {
+            var ps = string.Join(", ",
+                fn.Signature.Parameters.Select(p => $"{p.Name}: {p.Type.OriginalRepresentation}"));
+            var ret = fn.Signature.ReturnType.IsSameTypeAs(PrimitiveType.Null)
+                ? ""
+                : $" : {fn.Signature.ReturnType.OriginalRepresentation}";
+            return $"fun {fn.Name}({ps}){ret}";
+        }
 
         /// <summary>
         /// Derives an Elixir module alias (PascalCase, e.g. <c>ClientServer</c>) from the P project

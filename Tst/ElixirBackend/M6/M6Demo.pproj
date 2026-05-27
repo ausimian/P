@@ -1,0 +1,8 @@
+<!-- P project for the Elixir backend M6 fixture (foreign types and foreign functions). -->
+<Project>
+<ProjectName>M6Demo</ProjectName>
+<InputFiles>
+	<PFile>./Foreign.p</PFile>
+</InputFiles>
+<OutputDir>./PGenerated/</OutputDir>
+</Project>
